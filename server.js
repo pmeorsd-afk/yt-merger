@@ -31,16 +31,10 @@ async function downloadToFile(url, filepath) {
   });
 }
 
-app.post('/merge', async (req, res) => {
-  const { videoUrl, audioUrl, filename } = req.body;
-  if (!videoUrl || !audioUrl) {
-    return res.status(400).json({ error: 'missing videoUrl or audioUrl' });
-  }
-
-  const tmpDir   = fs.mkdtempSync(path.join(os.tmpdir(), 'yt-'));
+async function doMerge(videoUrl, audioUrl, filename, res) {
+  const tmpDir    = fs.mkdtempSync(path.join(os.tmpdir(), 'yt-'));
   const videoFile = path.join(tmpDir, 'video.mp4');
   const audioFile = path.join(tmpDir, 'audio.mp4');
-  const outFile   = path.join(tmpDir, 'output.mp4');
 
   try {
     console.log('downloading video...');
@@ -50,7 +44,6 @@ app.post('/merge', async (req, res) => {
     console.log('merging...');
 
     const safeFilename = (filename || 'video.mp4').replace(/[^\w\s\-_.()[\]]/g, '_');
-
     res.setHeader('Content-Type', 'video/mp4');
     res.setHeader('Content-Disposition', `attachment; filename="${safeFilename}"`);
 
@@ -66,12 +59,32 @@ app.post('/merge', async (req, res) => {
     });
 
     console.log('done!');
+  } finally {
+    try { fs.rmSync(tmpDir, { recursive: true }); } catch {}
+  }
+}
+
+// POST endpoint
+app.post('/merge', async (req, res) => {
+  const { videoUrl, audioUrl, filename } = req.body;
+  if (!videoUrl || !audioUrl) return res.status(400).json({ error: 'missing urls' });
+  try {
+    await doMerge(videoUrl, audioUrl, filename, res);
   } catch (err) {
     console.error('error:', err.message);
     if (!res.headersSent) res.status(500).json({ error: err.message });
-  } finally {
-    // cleanup
-    try { fs.rmSync(tmpDir, { recursive: true }); } catch {}
+  }
+});
+
+// GET endpoint — Chrome downloads.download can use this directly
+app.get('/merge', async (req, res) => {
+  const { videoUrl, audioUrl, filename } = req.query;
+  if (!videoUrl || !audioUrl) return res.status(400).json({ error: 'missing urls' });
+  try {
+    await doMerge(decodeURIComponent(videoUrl), decodeURIComponent(audioUrl), filename, res);
+  } catch (err) {
+    console.error('error:', err.message);
+    if (!res.headersSent) res.status(500).json({ error: err.message });
   }
 });
 
