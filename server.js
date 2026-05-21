@@ -72,17 +72,27 @@ function streamMerge({ videoUrl, audioUrl, filename }, req, res) {
     'pipe:1',
   ];
 
-  res.setHeader('Content-Type', 'video/mp4');
-  res.setHeader('Content-Disposition', `attachment; filename="${safeFilename}"`);
-  res.setHeader('Transfer-Encoding', 'chunked');
-  res.setHeader('Cache-Control', 'no-cache');
-  res.setHeader('X-Accel-Buffering', 'no');
-
   const ff = spawn('ffmpeg', args);
-  ff.stdout.pipe(res);
+  let startedStreaming = false;
+  let stderrTail = '';
+
+  ff.stdout.on('data', chunk => {
+    if (!startedStreaming) {
+      startedStreaming = true;
+      res.setHeader('Content-Type', 'video/mp4');
+      res.setHeader('Content-Disposition', `attachment; filename="${safeFilename}"`);
+      res.setHeader('Transfer-Encoding', 'chunked');
+      res.setHeader('Cache-Control', 'no-cache');
+      res.setHeader('X-Accel-Buffering', 'no');
+    }
+    res.write(chunk);
+  });
 
   ff.stderr.on('data', d => {
     const line = d.toString().trim();
+    if (line) {
+      stderrTail = (stderrTail + '\n' + line).slice(-1500);
+    }
     if (line.includes('time=') || line.includes('Error') || line.includes('error')) {
       console.log('[ffmpeg]', line.slice(0, 200));
     }
@@ -90,7 +100,12 @@ function streamMerge({ videoUrl, audioUrl, filename }, req, res) {
 
   ff.on('close', code => {
     console.log(`[merge] ffmpeg exited ${code} - ${safeFilename}`);
-    if (code !== 0) console.error('[merge] ffmpeg failed', { code, safeFilename });
+    if (code !== 0) {
+      console.error('[merge] ffmpeg failed', { code, safeFilename, stderrTail: stderrTail.slice(-400) });
+      if (!startedStreaming && !res.headersSent) {
+        return res.status(502).json({ error: 'ffmpeg_failed', code, details: stderrTail.slice(-300) });
+      }
+    }
     if (!res.writableEnded) res.end();
   });
 
