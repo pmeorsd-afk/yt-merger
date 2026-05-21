@@ -1,12 +1,21 @@
 const express = require('express');
 const ffmpeg  = require('fluent-ffmpeg');
 const fetch   = require('node-fetch');
-const { PassThrough } = require('stream');
 
 const app  = express();
 app.use(express.json());
 
+// CORS — allow Chrome extensions
+app.use((req, res, next) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  if (req.method === 'OPTIONS') return res.sendStatus(204);
+  next();
+});
+
 app.get('/', (req, res) => res.json({ status: 'ok', service: 'yt-merger' }));
+app.get('/health', (req, res) => res.json({ status: 'ok' }));
 
 app.post('/merge', async (req, res) => {
   const { videoUrl, audioUrl, filename } = req.body;
