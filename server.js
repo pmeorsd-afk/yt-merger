@@ -36,12 +36,13 @@ function cleanupExpiredJobs() {
 
 setInterval(cleanupExpiredJobs, 60 * 1000).unref();
 
-function streamMerge({ videoUrl, audioUrl, filename }, req, res) {
+function streamMerge({ videoUrl, audioUrl, filename, audioMime }, req, res) {
   const safeFilename = sanitizeFilename(filename);
   const UA =
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
 
   console.log('[merge] starting:', safeFilename);
+  const copyAudio = String(audioMime || '').includes('audio/mp4');
 
   const args = [
     '-user_agent',
@@ -58,10 +59,7 @@ function streamMerge({ videoUrl, audioUrl, filename }, req, res) {
     audioUrl,
     '-c:v',
     'copy',
-    '-c:a',
-    'aac',
-    '-ab',
-    '192k',
+    ...(copyAudio ? ['-c:a', 'copy'] : ['-c:a', 'aac', '-ab', '160k']),
     '-map',
     '0:v:0',
     '-map',
@@ -72,6 +70,7 @@ function streamMerge({ videoUrl, audioUrl, filename }, req, res) {
     'mp4',
     'pipe:1',
   ];
+  console.log('[merge] audio mode:', copyAudio ? 'copy' : 'transcode');
 
   const ff = spawn('ffmpeg', args);
   let startedStreaming = false;
@@ -124,7 +123,7 @@ function streamMerge({ videoUrl, audioUrl, filename }, req, res) {
 }
 
 app.post('/merge-init', (req, res) => {
-  const { videoUrl, audioUrl, filename } = req.body || {};
+  const { videoUrl, audioUrl, filename, audioMime } = req.body || {};
   if (!videoUrl || !audioUrl) {
     return res.status(400).json({ error: 'videoUrl and audioUrl required' });
   }
@@ -133,6 +132,7 @@ app.post('/merge-init', (req, res) => {
   mergeJobs.set(id, {
     videoUrl: String(videoUrl),
     audioUrl: String(audioUrl),
+    audioMime: String(audioMime || ''),
     filename: String(filename || 'video.mp4'),
     createdAt: Date.now(),
   });
@@ -154,7 +154,7 @@ app.get('/merge/:id', (req, res) => {
   const job = mergeJobs.get(req.params.id);
   if (!job) return res.status(404).json({ error: 'merge job not found or expired' });
 
-  // keep briefly for duplicate browser requests
+  // Keep briefly for duplicate browser requests
   setTimeout(() => mergeJobs.delete(req.params.id), 90 * 1000).unref();
   return streamMerge(job, req, res);
 });
@@ -165,7 +165,12 @@ app.get('/merge', (req, res) => {
     return res.status(400).json({ error: 'videoUrl and audioUrl required' });
   }
   return streamMerge(
-    { videoUrl: String(videoUrl), audioUrl: String(audioUrl), filename: String(filename || 'video.mp4') },
+    {
+      videoUrl: String(videoUrl),
+      audioUrl: String(audioUrl),
+      audioMime: String(req.query.audioMime || ''),
+      filename: String(filename || 'video.mp4')
+    },
     req,
     res
   );
