@@ -1,11 +1,14 @@
 const express = require('express');
 const ffmpeg  = require('fluent-ffmpeg');
 const fetch   = require('node-fetch');
+const fs      = require('fs');
+const path    = require('path');
+const os      = require('os');
 
-const app  = express();
+const app = express();
 app.use(express.json());
 
-// CORS — allow Chrome extensions
+// CORS
 app.use((req, res, next) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
@@ -17,49 +20,58 @@ app.use((req, res, next) => {
 app.get('/', (req, res) => res.json({ status: 'ok', service: 'yt-merger' }));
 app.get('/health', (req, res) => res.json({ status: 'ok' }));
 
+async function downloadToFile(url, filepath) {
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`fetch failed: ${res.status}`);
+  return new Promise((resolve, reject) => {
+    const stream = fs.createWriteStream(filepath);
+    res.body.pipe(stream);
+    stream.on('finish', resolve);
+    stream.on('error', reject);
+  });
+}
+
 app.post('/merge', async (req, res) => {
   const { videoUrl, audioUrl, filename } = req.body;
-
   if (!videoUrl || !audioUrl) {
     return res.status(400).json({ error: 'missing videoUrl or audioUrl' });
   }
 
+  const tmpDir   = fs.mkdtempSync(path.join(os.tmpdir(), 'yt-'));
+  const videoFile = path.join(tmpDir, 'video.mp4');
+  const audioFile = path.join(tmpDir, 'audio.mp4');
+  const outFile   = path.join(tmpDir, 'output.mp4');
+
   try {
-    const [videoRes, audioRes] = await Promise.all([
-      fetch(videoUrl),
-      fetch(audioUrl),
-    ]);
+    console.log('downloading video...');
+    await downloadToFile(videoUrl, videoFile);
+    console.log('downloading audio...');
+    await downloadToFile(audioUrl, audioFile);
+    console.log('merging...');
 
-    if (!videoRes.ok) return res.status(502).json({ error: 'video fetch failed: ' + videoRes.status });
-    if (!audioRes.ok) return res.status(502).json({ error: 'audio fetch failed: ' + audioRes.status });
-
-    const safeFilename = (filename || 'video.mp4')
-      .replace(/[^\w\s\-_.()[\]]/g, '_')
-      .replace(/\.txt$/i, '.mp4');
+    const safeFilename = (filename || 'video.mp4').replace(/[^\w\s\-_.()[\]]/g, '_');
 
     res.setHeader('Content-Type', 'video/mp4');
     res.setHeader('Content-Disposition', `attachment; filename="${safeFilename}"`);
 
-    ffmpeg()
-      .input(videoRes.body)
-      .inputFormat('mp4')
-      .input(audioRes.body)
-      .inputFormat('mp4')
-      .outputOptions([
-        '-c:v copy',
-        '-c:a copy',
-        '-movflags frag_keyframe+empty_moov+faststart',
-        '-f mp4',
-      ])
-      .on('error', (err) => {
-        console.error('ffmpeg error:', err.message);
-        if (!res.headersSent) res.status(500).json({ error: err.message });
-      })
-      .pipe(res, { end: true });
+    await new Promise((resolve, reject) => {
+      ffmpeg()
+        .input(videoFile)
+        .input(audioFile)
+        .outputOptions(['-c:v copy', '-c:a copy', '-movflags frag_keyframe+empty_moov+faststart'])
+        .format('mp4')
+        .on('end', resolve)
+        .on('error', reject)
+        .pipe(res, { end: true });
+    });
 
+    console.log('done!');
   } catch (err) {
-    console.error('merge error:', err.message);
+    console.error('error:', err.message);
     if (!res.headersSent) res.status(500).json({ error: err.message });
+  } finally {
+    // cleanup
+    try { fs.rmSync(tmpDir, { recursive: true }); } catch {}
   }
 });
 
