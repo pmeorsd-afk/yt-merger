@@ -20,106 +20,115 @@ app.use((req, res, next) => {
 app.get('/', (req, res) => res.json({ status: 'ok', service: 'yt-merger' }));
 app.get('/health', (req, res) => res.json({ status: 'ok' }));
 
-// ── YouTube Session Token endpoint ────────────────────────────────────────────
-// Cobalt calls this to get a fresh YouTube session
-const YT_COOKIES = process.env.YT_COOKIES || '';
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /merge?videoUrl=...&audioUrl=...&filename=...
+//
+// Chrome פותח הורדה ישירה לURL הזה.
+// השרת מוריד וידאו ואודיו במקביל, ממזג עם ffmpeg, ומשדר ישר.
+// ─────────────────────────────────────────────────────────────────────────────
+app.get('/merge', async (req, res) => {
+  const { videoUrl, audioUrl, filename } = req.query;
 
-app.get('/token', async (req, res) => {
+  if (!videoUrl || !audioUrl) {
+    return res.status(400).json({ error: 'videoUrl and audioUrl required' });
+  }
+
+  const safeFilename = (filename || 'video.mp4')
+    .replace(/[^\w\s\-.()]/g, '_')
+    .slice(0, 200);
+
+  console.log('[merge] starting:', safeFilename);
+
+  const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
+  const tmpDir  = os.tmpdir();
+  const videoTmp = path.join(tmpDir, `v_${Date.now()}.mp4`);
+  const audioTmp = path.join(tmpDir, `a_${Date.now()}.webm`);
+
+  // ניקוי קבצים זמניים
+  function cleanup() {
+    try { fs.unlinkSync(videoTmp); } catch(e) {}
+    try { fs.unlinkSync(audioTmp); } catch(e) {}
+  }
+
   try {
-    // שלוף visitor_data ו-po_token מ-YouTube
-    const cookieHeader = YT_COOKIES;
-    
-    const ytRes = await fetch('https://www.youtube.com/sw.js_data', {
-      headers: {
-        'Cookie': cookieHeader,
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-      }
-    });
+    // הורד וידאו ואודיו במקביל לדיסק זמני
+    console.log('[merge] downloading video + audio in parallel...');
+    const [videoResp, audioResp] = await Promise.all([
+      fetch(decodeURIComponent(videoUrl), {
+        headers: { 'User-Agent': UA, 'Referer': 'https://www.youtube.com/' }
+      }),
+      fetch(decodeURIComponent(audioUrl), {
+        headers: { 'User-Agent': UA, 'Referer': 'https://www.youtube.com/' }
+      }),
+    ]);
 
-    if (!ytRes.ok) {
-      return res.json({ error: 'failed to fetch youtube data' });
-    }
+    if (!videoResp.ok) throw new Error(`video fetch failed: ${videoResp.status} ${videoResp.statusText}`);
+    if (!audioResp.ok) throw new Error(`audio fetch failed: ${audioResp.status} ${audioResp.statusText}`);
 
-    const text = await ytRes.text();
-    const match = text.match(/"visitorData":"([^"]+)"/);
-    const visitorData = match?.[1] || '';
+    // שמור לדיסק זמני במקביל
+    await Promise.all([
+      streamToFile(videoResp.body, videoTmp),
+      streamToFile(audioResp.body, audioTmp),
+    ]);
 
-    res.json({
-      visitorData,
-      cookies: cookieHeader
-    });
+    const videoSize = fs.statSync(videoTmp).size;
+    const audioSize = fs.statSync(audioTmp).size;
+    console.log(`[merge] downloaded: video=${(videoSize/1e6).toFixed(1)}MB audio=${(audioSize/1e6).toFixed(1)}MB`);
+
+    if (videoSize < 1000) throw new Error('video file too small — YouTube rejected the URL');
+    if (audioSize < 1000) throw new Error('audio file too small — YouTube rejected the URL');
+
+    // Headers לChrome — הורדה מיידית
+    res.setHeader('Content-Type', 'video/mp4');
+    res.setHeader('Content-Disposition', `attachment; filename="${safeFilename}"`);
+    res.setHeader('Transfer-Encoding', 'chunked');
+
+    console.log('[merge] starting ffmpeg...');
+
+    // ffmpeg ממזג ומשדר ישר ל-response
+    ffmpeg()
+      .input(videoTmp)
+      .input(audioTmp)
+      .outputOptions([
+        '-c:v', 'copy',       // copy video — מהיר! אין re-encoding
+        '-c:a', 'aac',        // encode audio ל-AAC
+        '-ab', '192k',
+        '-movflags', 'frag_keyframe+empty_moov+faststart',
+        '-f', 'mp4',
+      ])
+      .on('start', cmd => console.log('[ffmpeg] cmd:', cmd.slice(0, 120)))
+      .on('end', () => {
+        console.log('[merge] done:', safeFilename);
+        cleanup();
+      })
+      .on('error', (err) => {
+        console.error('[ffmpeg] error:', err.message);
+        cleanup();
+        if (!res.writableEnded) res.end();
+      })
+      .pipe(res, { end: true });
+
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    cleanup();
+    console.error('[merge] error:', err.message);
+    if (!res.headersSent) {
+      res.status(500).json({ error: err.message });
+    } else {
+      res.end();
+    }
   }
 });
 
-// ── File download helper ──────────────────────────────────────────────────────
-async function downloadToFile(url, filepath) {
-  const res = await fetch(url);
-  if (!res.ok) throw new Error(`fetch failed: ${res.status}`);
+// helper: שמור ReadableStream לקובץ
+function streamToFile(readableStream, filePath) {
   return new Promise((resolve, reject) => {
-    const stream = fs.createWriteStream(filepath);
-    res.body.pipe(stream);
-    stream.on('finish', resolve);
-    stream.on('error', reject);
+    const writeStream = fs.createWriteStream(filePath);
+    readableStream.pipe(writeStream);
+    writeStream.on('finish', resolve);
+    writeStream.on('error', reject);
+    readableStream.on('error', reject);
   });
 }
 
-// ── Merge logic ───────────────────────────────────────────────────────────────
-async function doMerge(videoUrl, audioUrl, filename, res) {
-  const tmpDir    = fs.mkdtempSync(path.join(os.tmpdir(), 'yt-'));
-  const videoFile = path.join(tmpDir, 'video.mp4');
-  const audioFile = path.join(tmpDir, 'audio.mp4');
-
-  try {
-    console.log('downloading video...');
-    await downloadToFile(videoUrl, videoFile);
-    console.log('downloading audio...');
-    await downloadToFile(audioUrl, audioFile);
-    console.log('merging...');
-
-    const safeFilename = (filename || 'video.mp4').replace(/[^\w\s\-_.()[\]]/g, '_');
-    res.setHeader('Content-Type', 'video/mp4');
-    res.setHeader('Content-Disposition', `attachment; filename="${safeFilename}"`);
-
-    await new Promise((resolve, reject) => {
-      ffmpeg()
-        .input(videoFile)
-        .input(audioFile)
-        .outputOptions(['-c:v copy', '-c:a copy', '-movflags frag_keyframe+empty_moov+faststart'])
-        .format('mp4')
-        .on('end', resolve)
-        .on('error', reject)
-        .pipe(res, { end: true });
-    });
-
-    console.log('done!');
-  } finally {
-    try { fs.rmSync(tmpDir, { recursive: true }); } catch {}
-  }
-}
-
-app.post('/merge', async (req, res) => {
-  const { videoUrl, audioUrl, filename } = req.body;
-  if (!videoUrl || !audioUrl) return res.status(400).json({ error: 'missing urls' });
-  try {
-    await doMerge(videoUrl, audioUrl, filename, res);
-  } catch (err) {
-    console.error('error:', err.message);
-    if (!res.headersSent) res.status(500).json({ error: err.message });
-  }
-});
-
-app.get('/merge', async (req, res) => {
-  const { videoUrl, audioUrl, filename } = req.query;
-  if (!videoUrl || !audioUrl) return res.status(400).json({ error: 'missing urls' });
-  try {
-    await doMerge(decodeURIComponent(videoUrl), decodeURIComponent(audioUrl), filename, res);
-  } catch (err) {
-    console.error('error:', err.message);
-    if (!res.headersSent) res.status(500).json({ error: err.message });
-  }
-});
-
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log('yt-merger running on port', PORT));
+const PORT = process.env.PORT || 8080;
+app.listen(PORT, () => console.log(`yt-merger running on port ${PORT}`));
