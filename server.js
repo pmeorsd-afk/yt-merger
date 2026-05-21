@@ -20,6 +20,40 @@ app.use((req, res, next) => {
 app.get('/', (req, res) => res.json({ status: 'ok', service: 'yt-merger' }));
 app.get('/health', (req, res) => res.json({ status: 'ok' }));
 
+// ── YouTube Session Token endpoint ────────────────────────────────────────────
+// Cobalt calls this to get a fresh YouTube session
+const YT_COOKIES = process.env.YT_COOKIES || '';
+
+app.get('/token', async (req, res) => {
+  try {
+    // שלוף visitor_data ו-po_token מ-YouTube
+    const cookieHeader = YT_COOKIES;
+    
+    const ytRes = await fetch('https://www.youtube.com/sw.js_data', {
+      headers: {
+        'Cookie': cookieHeader,
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+      }
+    });
+
+    if (!ytRes.ok) {
+      return res.json({ error: 'failed to fetch youtube data' });
+    }
+
+    const text = await ytRes.text();
+    const match = text.match(/"visitorData":"([^"]+)"/);
+    const visitorData = match?.[1] || '';
+
+    res.json({
+      visitorData,
+      cookies: cookieHeader
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── File download helper ──────────────────────────────────────────────────────
 async function downloadToFile(url, filepath) {
   const res = await fetch(url);
   if (!res.ok) throw new Error(`fetch failed: ${res.status}`);
@@ -31,6 +65,7 @@ async function downloadToFile(url, filepath) {
   });
 }
 
+// ── Merge logic ───────────────────────────────────────────────────────────────
 async function doMerge(videoUrl, audioUrl, filename, res) {
   const tmpDir    = fs.mkdtempSync(path.join(os.tmpdir(), 'yt-'));
   const videoFile = path.join(tmpDir, 'video.mp4');
@@ -64,7 +99,6 @@ async function doMerge(videoUrl, audioUrl, filename, res) {
   }
 }
 
-// POST endpoint
 app.post('/merge', async (req, res) => {
   const { videoUrl, audioUrl, filename } = req.body;
   if (!videoUrl || !audioUrl) return res.status(400).json({ error: 'missing urls' });
@@ -76,7 +110,6 @@ app.post('/merge', async (req, res) => {
   }
 });
 
-// GET endpoint — Chrome downloads.download can use this directly
 app.get('/merge', async (req, res) => {
   const { videoUrl, audioUrl, filename } = req.query;
   if (!videoUrl || !audioUrl) return res.status(400).json({ error: 'missing urls' });
