@@ -3,6 +3,7 @@ const { spawn } = require('child_process');
 const crypto = require('crypto');
 
 const app = express();
+app.set('trust proxy', true);
 app.use(express.json({ limit: '2mb' }));
 
 app.use((req, res, next) => {
@@ -152,7 +153,9 @@ app.head('/merge/:id', (req, res) => {
 app.get('/merge/:id', (req, res) => {
   const job = mergeJobs.get(req.params.id);
   if (!job) return res.status(404).json({ error: 'merge job not found or expired' });
-  mergeJobs.delete(req.params.id);
+
+  // keep briefly for duplicate browser requests
+  setTimeout(() => mergeJobs.delete(req.params.id), 90 * 1000).unref();
   return streamMerge(job, req, res);
 });
 
