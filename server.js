@@ -1,10 +1,11 @@
 const express = require('express');
-const { spawn } = require('child_process');
+const ffmpeg  = require('fluent-ffmpeg');
+const fetch   = require('node-fetch');
 
-const app = express();
+const app  = express();
 app.use(express.json());
 
-// CORS
+// CORS — allow Chrome extensions
 app.use((req, res, next) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
@@ -16,89 +17,51 @@ app.use((req, res, next) => {
 app.get('/', (req, res) => res.json({ status: 'ok', service: 'yt-merger' }));
 app.get('/health', (req, res) => res.json({ status: 'ok' }));
 
-// ─────────────────────────────────────────────────────────────────────────────
-// GET /merge?videoUrl=...&audioUrl=...&filename=...
-//
-// ffmpeg מוריד videoUrl + audioUrl ישירות מYouTube CDN ומשדר MP4 ל-Chrome.
-// Chrome פותח הורדה מיידית עם progress bar — אין המתנה!
-// ─────────────────────────────────────────────────────────────────────────────
-app.get('/merge', (req, res) => {
-  const { videoUrl, audioUrl, filename } = req.query;
+app.post('/merge', async (req, res) => {
+  const { videoUrl, audioUrl, filename } = req.body;
 
   if (!videoUrl || !audioUrl) {
-    return res.status(400).json({ error: 'videoUrl and audioUrl required' });
+    return res.status(400).json({ error: 'missing videoUrl or audioUrl' });
   }
 
-  const safeFilename = (filename || 'video.mp4')
-    .replace(/[^\w\s\-.()[\]]/g, '_')
-    .replace(/__+/g, '_')
-    .slice(0, 200);
+  try {
+    const [videoRes, audioRes] = await Promise.all([
+      fetch(videoUrl),
+      fetch(audioUrl),
+    ]);
 
-  const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
+    if (!videoRes.ok) return res.status(502).json({ error: 'video fetch failed: ' + videoRes.status });
+    if (!audioRes.ok) return res.status(502).json({ error: 'audio fetch failed: ' + audioRes.status });
 
-  console.log('[merge] starting:', safeFilename);
+    const safeFilename = (filename || 'video.mp4')
+      .replace(/[^\w\s\-_.()[\]]/g, '_')
+      .replace(/\.txt$/i, '.mp4');
 
-  // ffmpeg מוריד ישירות מYouTube CDN ומשדר output ל-stdout
-  const args = [
-    // input 1 — video
-    '-user_agent', UA,
-    '-headers', 'Referer: https://www.youtube.com/\r\nOrigin: https://www.youtube.com\r\n',
-    '-i', decodeURIComponent(videoUrl),
+    res.setHeader('Content-Type', 'video/mp4');
+    res.setHeader('Content-Disposition', `attachment; filename="${safeFilename}"`);
 
-    // input 2 — audio
-    '-user_agent', UA,
-    '-headers', 'Referer: https://www.youtube.com/\r\nOrigin: https://www.youtube.com\r\n',
-    '-i', decodeURIComponent(audioUrl),
+    ffmpeg()
+      .input(videoRes.body)
+      .inputFormat('mp4')
+      .input(audioRes.body)
+      .inputFormat('mp4')
+      .outputOptions([
+        '-c:v copy',
+        '-c:a copy',
+        '-movflags frag_keyframe+empty_moov+faststart',
+        '-f mp4',
+      ])
+      .on('error', (err) => {
+        console.error('ffmpeg error:', err.message);
+        if (!res.headersSent) res.status(500).json({ error: err.message });
+      })
+      .pipe(res, { end: true });
 
-    // output options
-    '-c:v', 'copy',          // copy video — מהיר, אין re-encode
-    '-c:a', 'aac',           // encode audio → AAC
-    '-ab', '192k',
-    '-map', '0:v:0',         // קח וידאו מinput 0
-    '-map', '1:a:0',         // קח אודיו מinput 1
-    '-movflags', 'frag_keyframe+empty_moov+faststart', // streaming MP4
-    '-f', 'mp4',
-    'pipe:1',                // פלט → stdout → HTTP response
-  ];
-
-  // שלח headers מיד — Chrome פותח הורדה לפני שffmpeg מסיים
-  res.setHeader('Content-Type', 'video/mp4');
-  res.setHeader('Content-Disposition', `attachment; filename="${safeFilename}"`);
-  res.setHeader('Transfer-Encoding', 'chunked');
-  res.setHeader('Cache-Control', 'no-cache');
-  res.setHeader('X-Accel-Buffering', 'no');
-
-  const ff = spawn('ffmpeg', args);
-
-  // pipe ffmpeg stdout → HTTP response (streaming)
-  ff.stdout.pipe(res);
-
-  ff.stderr.on('data', (d) => {
-    const line = d.toString().trim();
-    // הצג רק שורות חשובות
-    if (line.includes('time=') || line.includes('Error') || line.includes('error')) {
-      console.log('[ffmpeg]', line.slice(0, 120));
-    }
-  });
-
-  ff.on('close', (code) => {
-    console.log(`[merge] ffmpeg exited ${code} — ${safeFilename}`);
-    if (!res.writableEnded) res.end();
-  });
-
-  ff.on('error', (err) => {
-    console.error('[merge] spawn error:', err.message);
+  } catch (err) {
+    console.error('merge error:', err.message);
     if (!res.headersSent) res.status(500).json({ error: err.message });
-  });
-
-  // אם המשתמש סוגר את ההורדה — הרוג את ffmpeg
-  req.on('close', () => {
-    if (!ff.killed) {
-      ff.kill('SIGTERM');
-      console.log('[merge] client disconnected, killed ffmpeg');
-    }
-  });
+  }
 });
 
-const PORT = process.env.PORT || 8080;
-app.listen(PORT, () => console.log(`yt-merger running on port ${PORT}`));
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log('yt-merger running on port', PORT));
